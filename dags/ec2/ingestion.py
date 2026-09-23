@@ -8,7 +8,8 @@ Responsibilities:
 - Prune old S3 files
 - Validate downloaded data
 - Merge and engineer features
-- Trigger model training
+- Check for data drift
+- Trigger the training DAG (retrains only on drift; always forecasts + stops EC2)
 """
 
 import sys
@@ -147,6 +148,28 @@ def run_pytest_validation(**context):
     context["ti"].xcom_push(key="validation_passed", value=True)
 
 
+def run_drift_check(**context):
+    """
+    Compare the freshly engineered month against the training reference.
+    Returns True when the models should be retrained (see monitoring/drift.py);
+    trigger with conf {"force_retrain": true} to retrain regardless.
+    """
+    from monitoring.drift import run_drift_check as _run_drift_check
+
+    month = context["ti"].xcom_pull(task_ids="get_month")
+    if not month:
+        raise ValueError("No month received from get_month")
+
+    report = _run_drift_check(month)
+
+    dag_run = context.get("dag_run")
+    force = bool(dag_run and dag_run.conf and dag_run.conf.get("force_retrain"))
+    if force:
+        print("force_retrain set in trigger conf — retraining regardless of drift")
+
+    return report["should_retrain"] or force
+
+
 with DAG(
     dag_id="taxi_data_ingestion_ec2",
     description="Monthly taxi ingestion pipeline (EC2, flat layout)",
@@ -193,10 +216,18 @@ with DAG(
         bash_command=f"{BASH_PREFIX} python preprocess/features.py",
     )
 
+    detect_drift = PythonOperator(
+        task_id="detect_drift",
+        python_callable=run_drift_check,
+    )
+
+    # Always triggered: the training DAG owns forecast + stop_instance, and
+    # uses conf["retrain"] to decide whether to skip train_model.
     trigger_training = TriggerDagRunOperator(
         task_id="trigger_training",
         trigger_dag_id="taxi_model_training_ec2_self_stop",
+        conf={"retrain": "{{ ti.xcom_pull(task_ids='detect_drift') }}"},
         wait_for_completion=False,
     )
 
-    get_month >> prune_old_data >> [download_data, fetch_weather] >> validate_data >> merge_everything >> features >> trigger_training
+    get_month >> prune_old_data >> [download_data, fetch_weather] >> validate_data >> merge_everything >> features >> detect_drift >> trigger_training

@@ -31,26 +31,28 @@ The pipeline runs on Airflow and can be deployed in two ways:
                                       ▼
                          S3: final/hourly_zone_timeseries.parquet
                                       │
+                       detect_drift (monitoring/drift.py) ──► S3: monitoring/drift_<month>.json
+                                      │                        MLflow: taxi_drift_monitoring
         ┌─────────────────────────────────────────────────────────┐
-        │ local: triggered manually via taxi_model_training       │
-        │ ec2:   auto-triggered via TriggerDagRunOperator         │
+        │ local: triggered only when drift is detected            │
+        │ ec2:   always triggered, conf retrain=<drift detected>  │
         └─────────────────────────────────────────────────────────┘
                                       │
                                       ▼
                          ┌───────────────────────────┐
                          │   Training DAG (Airflow)  │
                          └───────────────────────────┘
-                          train_model → forecast (→ stop_instance on EC2)
+          check_retrain → [train_model] → forecast (→ stop_instance on EC2)
                                       │
                      ┌────────────────┴────────────────┐
                      ▼                                  ▼
-           MLflow (params, metrics,            S3: models/*.pkl
-           artifacts, model registry)          S3: forecasts/*.csv
+           MLflow (params, metrics,            S3: models/*.pkl + drift reference
+           model artifacts)                    S3: forecasts/*.csv
                                       │
                      ┌────────────────┴────────────────┐
                      ▼                                  ▼
               FastAPI Forecast API             Streamlit Map App
-              (api/serve.py, port 7860)        (app/streamlit_app.py)
+              (api/serve.py, port 7860)        (app/app.py)
 ```
 
 ---
@@ -78,11 +80,11 @@ the final MLflow-tracked training run (`OPTUNA_N_TRIALS`, default 20).
 ```
 dags/
   local/
-    taxi_data_pipeline.py     # taxi_data_ingestion_local DAG
-    taxi_model_pipeline.py    # taxi_model_training DAG (manual)
+    taxi_data_pipeline.py     # taxi_data_ingestion_local DAG (triggers training on drift)
+    taxi_model_pipeline.py    # taxi_model_training DAG (manual or drift-triggered)
   ec2/
-    ingestion.py              # taxi_data_ingestion_ec2 DAG (auto-triggers training)
-    training.py               # taxi_model_training_ec2_self_stop DAG
+    ingestion.py              # taxi_data_ingestion_ec2 DAG (always triggers training DAG)
+    training.py               # taxi_model_training_ec2_self_stop DAG (retrains only on drift)
 
 ingestion/
   download.py                 # download_month_to_s3 / prune_s3_months
@@ -105,8 +107,11 @@ api/
   engine.py                      # cached model + feature-store loading, inference, ranking
 
 app/
-  streamlit_app.py              # Streamlit zone-opportunity map (reads forecasts from S3)
+  app.py                        # Streamlit zone-opportunity map (reads forecasts from S3)
   dockerfile                     # Streamlit container (Hugging Face Spaces)
+
+mlflow_space/
+  Dockerfile                     # MLflow tracking server as a private Hugging Face Space (used by EC2)
 
 lambda/
   start_ec2.py                   # EventBridge -> start EC2 (monthly)
@@ -114,13 +119,22 @@ lambda/
 
 docker/
   Dockerfile.airflow             # Airflow image (local + EC2)
-  Dockerfile.airflow-ec2          # EC2 variant entrypoint
+  Dockerfile.airflow-ec2          # EC2 variant (same image; see comments for boot requirements)
   Dockerfile.api                  # FastAPI image
 
-tests/
-  test_data_validation_local.py
-  test_data_validation_ec2.py
+monitoring/
+  drift.py                      # monthly feature / target / performance drift check + retrain decision
 
+tests/
+  test_data_validation_local.py  # validates landed S3 data (skips without AWS config)
+  test_data_validation_ec2.py
+  test_drift.py                  # unit tests for drift statistics + retrain decision
+
+requirements/
+  base.txt / airflow.txt / api.txt
+
+.github/workflows/ci.yml          # lint, tests, Docker builds
+conftest.py                       # puts repo root on sys.path for pytest
 docker-compose.yml                # local dev stack
 docker-compose.ec2.yml             # EC2 stack (IAM role creds, localhost-only ports)
 ```
@@ -139,15 +153,48 @@ the previous calendar month), then:
 3. `validate_data` — runs `tests/test_data_validation_*.py` against the new data
 4. `merge_everything` — `preprocess/merge.py`
 5. `features` — `preprocess/features.py`
-6. *(EC2 only)* `trigger_training` — kicks off the training DAG
+6. `detect_drift` — `monitoring/drift.py` compares the new month to the training reference (see [Drift monitoring](#drift-monitoring))
+7. `trigger_training` — kicks off the training DAG
+   - local: only when drift is detected (`ShortCircuitOperator`)
+   - EC2: always, with conf `{"retrain": <drift detected>}` so the training DAG still forecasts and stops the instance
+
+Trigger with conf `{"force_retrain": true}` to retrain regardless of drift.
+
+> Airflow creates DAGs paused (`DAGS_ARE_PAUSED_AT_CREATION`). Unpause **both** the
+> ingestion and training DAGs, otherwise triggered training runs stay queued.
 
 ### Training DAG (`taxi_model_training` / `taxi_model_training_ec2_self_stop`)
 
-Manual trigger (or auto-triggered on EC2):
+Manual trigger, or triggered by the ingestion DAG:
 
-1. `train_model` — trains the 4-layer model stack, logs to MLflow, registers models
-2. `forecast` — loads production models, generates ranked forecasts, writes to S3
-3. *(EC2 only)* `stop_instance` — stops the EC2 host via its IAM role
+1. `check_retrain` — branches on conf `retrain` (default `true`); `false` skips `train_model`
+2. `train_model` — trains the 4-layer model stack, logs params/metrics/models to MLflow,
+   uploads models to S3, and writes the drift reference (`drift_reference.parquet`, `drift_baseline.json`)
+3. `forecast` — loads production models, generates ranked forecasts, writes to S3
+4. *(EC2 only)* `stop_instance` — stops the EC2 host via its IAM role
+
+---
+
+## Drift monitoring
+
+`monitoring/drift.py` runs monthly after feature engineering and compares the
+new month of `final/hourly_zone_timeseries.parquet` against a sample of the
+rows the production models were trained on (`models/drift_reference.parquet`).
+
+| Signal | Method | Retrain when (env override) |
+|---|---|---|
+| Feature drift | PSI per feature, weighted by demand-model importance; KS logged as supporting evidence | weighted share of features with PSI > 0.2 is > 0.3 (`DRIFT_PSI_THRESHOLD`, `DRIFT_SHARE_THRESHOLD`) |
+| Target drift | PSI on `trip_count`, `target_rph` | PSI > 0.2 (`DRIFT_TARGET_PSI_THRESHOLD`) |
+| Performance drift | past forecasts in `forecasts/` joined to the actuals that just landed | realised MAE/RMSE > 1.2× validation (`DRIFT_PERF_TOLERANCE`) |
+
+- Calendar features (`month`, `quarter`, `week_of_year`, `day_of_year`) and label-encoded zones are excluded.
+- The same calendar month of the reference is used when it has ≥ 10k rows (handles weather seasonality); otherwise the full reference.
+- With no reference yet (first run), it always requests a retrain.
+
+Results go to `s3://$S3_BUCKET/monitoring/drift_<month>.json` / `_features.csv`
+and the MLflow experiment `taxi_drift_monitoring` (one run per month, `psi_<feature>`
+metrics for comparing months). Run standalone with
+`TARGET_MONTH=2024-06 python monitoring/drift.py`.
 
 ---
 
@@ -174,7 +221,7 @@ in memory (`api/engine.py`).
 
 Demo: https://lcodecorn-nyc-taxi.hf.space
 
-`app/streamlit_app.py` reads the latest `forecasts/*.csv` from S3, joins it
+`app/app.py` reads the latest `forecasts/*.csv` from S3, joins it
 with the NYC taxi zone GeoJSON, and renders a choropleth map with per-zone
 demand/profitability/competition/opportunity scores, plus a sortable zone
 ranking table. Deployed as a Docker-based Hugging Face Space (`app/dockerfile`,
@@ -191,6 +238,19 @@ port 7860).
 
 Both setups read configuration from a `.env` file — copy `.env.example` to
 get started.
+
+After pulling changes to `requirements/airflow.txt`, rebuild the Airflow image
+(`docker compose build`, or `docker compose -f docker-compose.ec2.yml build`).
+
+## Tests & CI
+
+```
+pytest tests/ -v
+```
+
+`.github/workflows/ci.yml` runs on pushes and PRs to `main`: ruff (syntax
+errors / undefined names only), the test suite (data validation tests skip
+without AWS config), and Docker builds of the API, Airflow and Streamlit images.
 
 ## Services & ports (local)
 

@@ -6,10 +6,11 @@ Run the full NYC Taxi MLOps stack on your machine using `docker-compose.yml`.
 
 ```
 Airflow (webserver + scheduler + worker + triggerer)
-  → taxi_data_ingestion DAG
+  → taxi_data_ingestion_local DAG
       → download taxi & weather data → S3
       → merge + feature engineering
-  → taxi_model_training DAG (triggered automatically)
+      → drift check (monitoring/drift.py) → S3 + MLflow
+  → taxi_model_training DAG (triggered when drift is detected, or manually)
       → train → MLflow → forecast → S3
 
 MLflow server  →  http://localhost:5000
@@ -106,10 +107,12 @@ All containers should show `healthy` or `running` within ~2 minutes.
 ## Step 5 — Run the pipeline
 
 1. Open the Airflow UI at http://localhost:8080
-2. Unpause **`taxi_data_ingestion`**
-3. Click **Trigger DAG** → optionally pass `{"month": "2024-01"}` to target a specific month; leave empty to use the previous calendar month
-4. After ingestion completes, the training DAG (`taxi_model_training`) is triggered automatically
-5. Monitor MLflow at http://localhost:5000 to see runs, metrics, and registered models
+2. Unpause **`taxi_data_ingestion_local`** and **`taxi_model_training`** (a triggered run of a paused DAG stays queued)
+3. Click **Trigger DAG** on the ingestion DAG → optionally pass `{"month": "2024-01"}` to target a specific month; leave empty to use the previous calendar month. Add `"force_retrain": true` to retrain regardless of drift.
+4. After ingestion, `detect_drift` compares the new month to the training data. If drift is detected, `taxi_model_training` is triggered automatically; otherwise it is skipped. The first run always retrains (no reference exists yet).
+5. Monitor MLflow at http://localhost:5000 — `taxi_model_training` for training runs, `taxi_drift_monitoring` for monthly drift reports
+
+> The ingestion DAG has `catchup=True`, so unpausing it backfills up to 12 months — each month can trigger a training run if drift is found.
 
 ---
 

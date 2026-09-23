@@ -9,9 +9,9 @@ EventBridge (1st of month 06:00 UTC)
   → Lambda: start EC2
     → Docker auto-starts (systemd)
       → Airflow scheduler wakes up
-        → taxi_data_ingestion DAG runs
+        → taxi_data_ingestion_ec2 DAG runs (ingest → features → drift check)
           → triggers taxi_model_training_ec2_self_stop DAG
-            → train → forecast → EC2 stops itself
+            → train (only if drift detected) → forecast → EC2 stops itself
 
 EventBridge (1st of month 14:00 UTC) [safety net]
   → Lambda: force-stop EC2 if still running
@@ -388,10 +388,10 @@ Open `http://localhost:8081` — login: `airflow` / `airflow`.
 
 1. Start the instance manually from the EC2 console
 2. SSH tunnel in and open the Airflow UI
-3. Unpause `taxi_data_ingestion` and trigger it manually
-4. Watch it complete → automatically triggers `taxi_model_training_ec2_self_stop`
-5. After training and forecast, the instance stops itself
-6. Check your email for the deployment alert
+3. Unpause `taxi_data_ingestion_ec2` **and** `taxi_model_training_ec2_self_stop`, then trigger ingestion manually (pass `{"force_retrain": true}` to force a retrain)
+4. Watch it complete → `detect_drift` runs, then it automatically triggers `taxi_model_training_ec2_self_stop`
+5. `check_retrain` runs `train_model` only if drift was detected (always on the first run); forecast runs either way, then the instance stops itself
+6. If training ran, check your email for the deployment alert
 
 ---
 

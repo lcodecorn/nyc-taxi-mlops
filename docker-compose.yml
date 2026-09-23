@@ -76,6 +76,7 @@ x-airflow-common:
     - ${AIRFLOW_PROJ_DIR:-.}/preprocess:/opt/airflow/preprocess
     - ${AIRFLOW_PROJ_DIR:-.}/ingestion:/opt/airflow/ingestion
     - ${AIRFLOW_PROJ_DIR:-.}/models/local:/opt/airflow/models/local
+    - ${AIRFLOW_PROJ_DIR:-.}/monitoring:/opt/airflow/monitoring
     - ${AIRFLOW_PROJ_DIR:-.}/tests:/opt/airflow/tests
     - ${AIRFLOW_PROJ_DIR:-.}/.env:/opt/airflow/.env
   user: "${AIRFLOW_UID:-50000}:0"

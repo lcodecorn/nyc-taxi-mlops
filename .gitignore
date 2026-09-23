@@ -4,6 +4,8 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.pytest_cache/
+.ruff_cache/
 
 # Environment / secrets
 .env
@@ -26,6 +28,9 @@ data/
 models/local/models/
 mlruns/
 mlartifacts/
+
+# Forecast outputs written locally by models/*/forecast.py (CSV + .meta.json)
+forecasts/
 
 # Jupyter
 .ipynb_checkpoints/

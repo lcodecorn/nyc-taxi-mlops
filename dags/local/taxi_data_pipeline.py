@@ -7,9 +7,10 @@ Responsibilities:
 - Download weather data
 - Prune old S3 files
 
+- Validate, merge and engineer features
+- Check for data drift and trigger training when it is detected
+
 This DAG does NOT:
-- merge datasets
-- engineer features
 - train models
 - generate forecasts
 """
@@ -20,7 +21,8 @@ from datetime import datetime, timedelta
 
 from airflow import DAG
 from airflow.models.param import Param
-from airflow.operators.python import PythonOperator
+from airflow.operators.python import PythonOperator, ShortCircuitOperator
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.utils.dates import days_ago
 from airflow.operators.bash import BashOperator
 
@@ -192,6 +194,28 @@ def run_pytest_validation(**context):
     )
 
 
+def run_drift_check(**context):
+    """
+    Compare the freshly engineered month against the training reference.
+    Returns True when the models should be retrained (see monitoring/drift.py);
+    trigger with conf {"force_retrain": true} to retrain regardless.
+    """
+    from monitoring.drift import run_drift_check as _run_drift_check
+
+    month = context["ti"].xcom_pull(task_ids="get_month")
+    if not month:
+        raise ValueError("No month received from get_month")
+
+    report = _run_drift_check(month)
+
+    dag_run = context.get("dag_run")
+    force = bool(dag_run and dag_run.conf and dag_run.conf.get("force_retrain"))
+    if force:
+        print("force_retrain set in trigger conf — retraining regardless of drift")
+
+    return report["should_retrain"] or force
+
+
 with DAG(
     dag_id="taxi_data_ingestion_local",
     description="Monthly taxi ingestion pipeline (local docker)",
@@ -242,4 +266,17 @@ with DAG(
         },
     )
 
-    get_month >> prune_old_data >> [download_data, fetch_weather] >> validate_data >> merge_everything >> features2
+    # Skips trigger_training when no drift is detected
+    detect_drift = ShortCircuitOperator(
+        task_id="detect_drift",
+        python_callable=run_drift_check,
+    )
+
+    trigger_training = TriggerDagRunOperator(
+        task_id="trigger_training",
+        trigger_dag_id="taxi_model_training",
+        conf={"retrain": True},
+        wait_for_completion=False,
+    )
+
+    get_month >> prune_old_data >> [download_data, fetch_weather] >> validate_data >> merge_everything >> features2 >> detect_drift >> trigger_training

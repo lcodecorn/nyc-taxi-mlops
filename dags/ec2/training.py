@@ -4,7 +4,9 @@ Taxi model training DAG — EC2 self-stop variant.
 Runs only when manually triggered (or chained from the ingestion DAG).
 
 Pipeline:
-    train_model -> forecast -> stop_instance
+    check_retrain -> [train_model] -> forecast -> stop_instance
+
+train_model is skipped when the ingestion DAG finds no drift (conf retrain=false).
 """
 
 from datetime import datetime, timedelta
@@ -12,7 +14,7 @@ from datetime import datetime, timedelta
 import requests
 from airflow import DAG
 from airflow.operators.bash import BashOperator
-from airflow.operators.python import PythonOperator
+from airflow.operators.python import BranchPythonOperator, PythonOperator
 
 default_args = {
     "owner": "mlops",
@@ -63,6 +65,18 @@ def stop_self(**context):
     ec2.stop_instances(InstanceIds=[instance_id])
 
 
+def choose_path(**context):
+    """
+    Skip train_model when triggered with conf {"retrain": false} (no drift
+    detected upstream) and go straight to forecasting with the current models.
+    Manual triggers without conf retrain as before.
+    """
+    conf = context["dag_run"].conf or {}
+    retrain = str(conf.get("retrain", True)).strip().lower() not in ("false", "0", "no")
+    print(f"retrain={retrain} (conf={conf})")
+    return "train_model" if retrain else "forecast"
+
+
 with DAG(
     dag_id="taxi_model_training_ec2_self_stop",
     description="Train models, generate forecast, then stop the EC2 host",
@@ -73,6 +87,11 @@ with DAG(
     tags=["taxi", "training", "ec2"],
 ) as dag:
 
+    check_retrain = BranchPythonOperator(
+        task_id="check_retrain",
+        python_callable=choose_path,
+    )
+
     train_model = BashOperator(
         task_id="train_model",
         bash_command=f"{BASH_PREFIX} python models/ec2/train.py",
@@ -81,6 +100,7 @@ with DAG(
 
     forecast = BashOperator(
         task_id="forecast",
+        trigger_rule="none_failed_min_one_success",
         bash_command=f"{BASH_PREFIX} python models/ec2/forecast.py",
         execution_timeout=timedelta(hours=1),
     )
@@ -91,4 +111,5 @@ with DAG(
         trigger_rule="all_success",
     )
 
+    check_retrain >> [train_model, forecast]
     train_model >> forecast >> stop_instance
