@@ -12,8 +12,9 @@ Fixes applied vs. previous version
 - high_tip_zone computed BEFORE the train/valid/test split so every split
   carries the label without a SettingWithCopyWarning / silent NaN.
 - All three split DataFrames are .copy() so downstream mutations are safe.
-- competition_target is sliced after the split, not before, removing the
-  index-alignment bug that could occur when df is re-sorted or filtered.
+- competition_target is assigned directly onto each split frame (not sliced
+  by position from a full-df Series), removing the index-alignment bug that
+  could occur when df is re-sorted or filtered.
 - MLflow run wraps ALL training (not just metrics) so params and artifacts
   are always logged even when a metric step raises.
 - MLFLOW_TRACKING_URI default is http://mlflow:5000 (Docker service name);
@@ -25,6 +26,13 @@ Fixes applied vs. previous version
 - Bayesian hyperparameter search (Optuna TPE) runs before the MLflow run.
   Best params per layer are logged as MLflow params alongside metrics.
   Set OPTUNA_N_TRIALS to control search budget (default 20).
+- competition_target no longer sums lag_1h_trip_count + rolling_24h_rph_std +
+  congestion_score — the first two are also in FEATURES, so the model was
+  being handed two-thirds of its own label as input and just copying it
+  back out, making competition_valid_rmse meaningless. Now built from
+  net_pickup_flow/congestion_score (never raw model inputs, only their
+  lag1h_ versions are), z-scored on train-only stats. See
+  assign_competition_target.
 """
 
 from __future__ import annotations
@@ -48,6 +56,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, mean_absolute_error, mean_squared_error
 from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBRegressor
+
+from monitoring.drift import save_reference
 
 warnings.filterwarnings("ignore")
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -175,12 +185,32 @@ def split_data(
     return train_df, valid_df, test_df, X_train, X_valid, X_test
 
 
-def build_competition_target(df: pd.DataFrame) -> pd.Series:
-    return (
-        df["lag_1h_trip_count"].fillna(0)
-        + df["rolling_24h_rph_std"].fillna(0)
-        + df["congestion_score"].fillna(0)
-    )
+def assign_competition_target(
+    train_df: pd.DataFrame, valid_df: pd.DataFrame, test_df: pd.DataFrame
+) -> None:
+    """
+    Composite supply/demand-pressure proxy: oversupply (dropoffs outpacing
+    pickups, i.e. -net_pickup_flow) plus congestion, both z-scored using
+    train-only mean/std so valid/test don't leak into the label's scale —
+    same pattern as the tip-rate threshold in assign_tip_labels.
+
+    Built only from columns that are NOT in FEATURES (net_pickup_flow and
+    congestion_score are same-hour values; the model only ever sees their
+    lag1h_ versions as inputs). The previous version summed
+    lag_1h_trip_count + rolling_24h_rph_std + congestion_score, but the
+    first two are themselves entries in FEATURES — the model was handed
+    2/3 of its own label as an input and just learned to copy it back out,
+    making the validation RMSE meaningless as a signal of real skill.
+    """
+    oversupply_train = -train_df["net_pickup_flow"].fillna(0)
+    congestion_train = train_df["congestion_score"].fillna(0)
+    os_mean, os_std = oversupply_train.mean(), oversupply_train.std()
+    cg_mean, cg_std = congestion_train.mean(), congestion_train.std()
+
+    for split_df in (train_df, valid_df, test_df):
+        oversupply = (-split_df["net_pickup_flow"].fillna(0) - os_mean) / (os_std + 1e-9)
+        congestion = (split_df["congestion_score"].fillna(0) - cg_mean) / (cg_std + 1e-9)
+        split_df["competition_target"] = oversupply + congestion
 
 
 # Bayesian hyperparameter search (Optuna TPE)
@@ -279,10 +309,10 @@ def main() -> None:
     # high_tip_zone threshold computed from train split only, then applied to all splits
     assign_tip_labels(train_df, valid_df, test_df)
 
-    # Competition target sliced from already-split frames (no alignment bug)
-    comp_target_full  = build_competition_target(df)
-    comp_target_train = comp_target_full.iloc[: len(train_df)]
-    comp_target_valid = comp_target_full.iloc[len(train_df) : len(train_df) + len(valid_df)]
+    # Competition target (z-score stats from train split only, applied to all splits)
+    assign_competition_target(train_df, valid_df, test_df)
+    comp_target_train = train_df["competition_target"]
+    comp_target_valid = valid_df["competition_target"]
 
     tip_imputer = SimpleImputer(strategy="median")
     X_train_tip = tip_imputer.fit_transform(X_train)
@@ -387,6 +417,16 @@ def main() -> None:
         })
         joblib.dump(tip_model,    MODEL_DIR / "tip_model.pkl")
         joblib.dump(tip_imputer,  MODEL_DIR / "tip_imputer.pkl")
+
+        # ── Drift reference (read by monitoring/drift.py) ────────────────────
+        save_reference(
+            train_df, active_features, demand_model,
+            valid_metrics={
+                "demand_valid_mae": _mae(valid_df["trip_count"], d_valid_pred),
+                "profit_valid_rmse": _rmse(valid_df["target_rph"], p_valid_pred),
+            },
+            out_dir=MODEL_DIR,
+        )
 
         # ── Encoders + metadata ──────────────────────────────────────────────
         joblib.dump(zone_encoder,    MODEL_DIR / "zone_encoder.pkl")

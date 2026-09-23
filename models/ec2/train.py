@@ -12,6 +12,13 @@ Best params per layer are logged as MLflow params alongside metrics.
 A deployment alert email is sent via Gmail SMTP after every successful run.
 Requires ALERT_EMAIL, SMTP_USER, SMTP_PASSWORD in the environment.
 Set OPTUNA_N_TRIALS to control search budget (default 20).
+
+competition_target is built in assign_competition_target from
+net_pickup_flow/congestion_score (never raw model inputs — only their
+lag1h_ versions are in FEATURES), z-scored on train-only stats. It used to
+sum lag_1h_trip_count + rolling_24h_rph_std + congestion_score, but the
+first two are themselves entries in FEATURES, so the model was just
+copying 2/3 of its label back out of its own inputs.
 """
 
 from __future__ import annotations
@@ -36,6 +43,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, mean_absolute_error, mean_squared_error
 from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBRegressor
+
+from monitoring.drift import save_reference
 
 warnings.filterwarnings("ignore")
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -158,12 +167,32 @@ def split_data(
     return train_df, valid_df, test_df, X_train, X_valid, X_test
 
 
-def build_competition_target(df: pd.DataFrame) -> pd.Series:
-    return (
-        df["lag_1h_trip_count"].fillna(0)
-        + df["rolling_24h_rph_std"].fillna(0)
-        + df["congestion_score"].fillna(0)
-    )
+def assign_competition_target(
+    train_df: pd.DataFrame, valid_df: pd.DataFrame, test_df: pd.DataFrame
+) -> None:
+    """
+    Composite supply/demand-pressure proxy: oversupply (dropoffs outpacing
+    pickups, i.e. -net_pickup_flow) plus congestion, both z-scored using
+    train-only mean/std so valid/test don't leak into the label's scale —
+    same pattern as the tip-rate threshold in assign_tip_labels.
+
+    Built only from columns that are NOT in FEATURES (net_pickup_flow and
+    congestion_score are same-hour values; the model only ever sees their
+    lag1h_ versions as inputs). The previous version summed
+    lag_1h_trip_count + rolling_24h_rph_std + congestion_score, but the
+    first two are themselves entries in FEATURES — the model was handed
+    2/3 of its own label as an input and just learned to copy it back out,
+    making the validation RMSE meaningless as a signal of real skill.
+    """
+    oversupply_train = -train_df["net_pickup_flow"].fillna(0)
+    congestion_train = train_df["congestion_score"].fillna(0)
+    os_mean, os_std = oversupply_train.mean(), oversupply_train.std()
+    cg_mean, cg_std = congestion_train.mean(), congestion_train.std()
+
+    for split_df in (train_df, valid_df, test_df):
+        oversupply = (-split_df["net_pickup_flow"].fillna(0) - os_mean) / (os_std + 1e-9)
+        congestion = (split_df["congestion_score"].fillna(0) - cg_mean) / (cg_std + 1e-9)
+        split_df["competition_target"] = oversupply + congestion
 
 
 def upload_and_log_artifacts(run: mlflow.ActiveRun) -> None:
@@ -370,9 +399,10 @@ def main() -> None:
     # high_tip_zone threshold computed from train split only, then applied to all splits
     assign_tip_labels(train_df, valid_df, test_df)
 
-    comp_target_full  = build_competition_target(df)
-    comp_target_train = comp_target_full.iloc[:len(train_df)]
-    comp_target_valid = comp_target_full.iloc[len(train_df):len(train_df) + len(valid_df)]
+    # Competition target (z-score stats from train split only, applied to all splits)
+    assign_competition_target(train_df, valid_df, test_df)
+    comp_target_train = train_df["competition_target"]
+    comp_target_valid = valid_df["competition_target"]
 
     tip_imputer = SimpleImputer(strategy="median")
     X_train_tip = tip_imputer.fit_transform(X_train)
@@ -470,6 +500,13 @@ def main() -> None:
         mlflow.log_metrics(m); collected.update(m)
         joblib.dump(tip_model,   MODEL_DIR / "tip_model.pkl")
         joblib.dump(tip_imputer, MODEL_DIR / "tip_imputer.pkl")
+
+        # Drift reference (read by monitoring/drift.py)
+        save_reference(
+            train_df, active_features, demand_model,
+            valid_metrics={k: collected[k] for k in ("demand_valid_mae", "profit_valid_rmse")},
+            out_dir=MODEL_DIR,
+        )
 
         # Encoders + metadata
         joblib.dump(zone_encoder,    MODEL_DIR / "zone_encoder.pkl")
