@@ -13,3 +13,7 @@ requests
 mlflow
 optuna
 scipy
+# Unpinned mlflow pulls in the newest cryptography; >=49 breaks the pyOpenSSL 24.1
+# shipped with apache/airflow:2.9.1 ("module 'lib' has no attribute 'GEN_EMAIL'"),
+# which crashes every `import boto3`.
+cryptography<49

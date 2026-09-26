@@ -60,6 +60,10 @@ x-airflow-common:
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    # Default is 1s; the first send imports redis.client, which can take ~1s on
+    # Docker/WSL2 — the timeout then leaves a half-imported module and every task
+    # fails with "module 'redis' has no attribute 'client'".
+    AIRFLOW__CELERY__OPERATION_TIMEOUT: '10'
     # AWS credentials and S3 settings (read from .env)
     AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
     AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
