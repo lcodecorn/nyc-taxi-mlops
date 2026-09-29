@@ -64,9 +64,12 @@ RAW_LAG1H_COLS = [
     "avg_revenue", "avg_tip", "tip_rate",
     "avg_distance_mi", "avg_duration_min", "avg_speed_mph",
     "congestion_score", "dropoff_count", "net_pickup_flow",
-    "frac_airport_pickup", "frac_airport_dropoff", "demand_vs_baseline",
+    "frac_airport_pickup", "frac_airport_dropoff",
     "precipitation", "temperature", "wind_speed", "frac_raining",
 ]
+
+# Longest look-back any feature needs (lag_168h_rph, rolling_7d_rph_mean).
+MAX_LOOKBACK_HOURS = 168
 
 # LOAD MODELS
 def load_models():
@@ -94,6 +97,19 @@ def load_history(zone_enc, borough_enc):
     print("Loading historical context from S3...")
     download_timeseries_from_s3()
     df = pd.read_parquet(TMP_TIMESERIES).sort_values("ts_hour")
+
+    # The store also holds zone-hours below the training trip_count threshold,
+    # so it can contain zones the encoders never saw — drop them (same as
+    # api/engine.py). Features are per zone, so other zones are unaffected.
+    known_mask = (
+        df["PUZone"].notna() & df["PUZone"].isin(zone_enc.classes_)
+        & df["PUBorough"].notna() & df["PUBorough"].isin(borough_enc.classes_)
+    )
+    dropped = (~known_mask).sum()
+    if dropped:
+        print(f"  Dropping {dropped:,} history rows with zones unseen by the trained encoders")
+    df = df[known_mask]
+
     df["PUZone_enc"] = zone_enc.transform(df["PUZone"])
     df["PUBorough_enc"] = borough_enc.transform(df["PUBorough"])
     return df
@@ -180,74 +196,109 @@ def build_future_frame(df_hist, start_dt, n_hours, zone_enc):
 
 
 # ATTACH LAG & ROLLING FEATURES
+def history_before(df_hist, start_dt):
+    """
+    History strictly before the forecast start. Nothing at or after it may
+    feed a forecast — matters for backtests whose start lies inside the store.
+    """
+    hist = df_hist[df_hist["ts_hour"] < pd.Timestamp(start_dt)]
+    if hist.empty:
+        raise ValueError(f"No history before forecast start {start_dt}")
+    return hist
+
+
 def attach_lag_features(future, df_hist):
+    """
+    Rebuild the lag / rolling features exactly as preprocess/features.py does:
+    on a gap-free zone × hour grid, so "24h" means 24 hours rather than the
+    last 24 rows a zone happened to have trips in.
+
+    Pass the FULL store as df_hist: it is cut at the forecast start here, but
+    its last hour says how far the data actually extends. Grid hours before
+    the start and within the store are observed: no stored row means no
+    pickups, so trip_count = 0 and every per-trip aggregate is NaN (same as the
+    SQL `dense` CTE). Later hours are unknown and stay entirely NaN, so
+    windows reaching into the horizon only average what was actually observed,
+    and lags landing in the horizon are left for fill_missing.
+    """
     print("  Computing lag / rolling features...")
 
-    raw_lag1h_cols = [c for c in RAW_LAG1H_COLS if c in df_hist.columns]
-    hist = df_hist[["PUZone", "ts_hour", "trip_count", "target_rph"] + raw_lag1h_cols].copy()
-    hist = hist.sort_values(["PUZone", "ts_hour"])
+    start = future["ts_hour"].min()
+    hist = history_before(df_hist, start)
+    last_observed = min(df_hist["ts_hour"].max(), start - pd.Timedelta(hours=1))
 
-    grp = hist.groupby("PUZone", sort=False)
+    raw_lag1h_cols = [c for c in RAW_LAG1H_COLS if c in hist.columns]
+    value_cols = ["trip_count", "target_rph"] + raw_lag1h_cols
 
-    hist["rolling_24h_trip_mean"] = grp["trip_count"].transform(
-        lambda s: s.shift(1).rolling(24, min_periods=1).mean()
+    grid_start = start - pd.Timedelta(hours=MAX_LOOKBACK_HOURS)
+    dense = pd.MultiIndex.from_product(
+        [future["PUZone"].unique(), pd.date_range(grid_start, future["ts_hour"].max(), freq="h")],
+        names=["PUZone", "ts_hour"],
+    ).to_frame(index=False)
+    dense = dense.merge(
+        hist.loc[hist["ts_hour"] >= grid_start, ["PUZone", "ts_hour"] + value_cols],
+        on=["PUZone", "ts_hour"], how="left",
     )
-    hist["rolling_168h_trip_mean"] = grp["trip_count"].transform(
-        lambda s: s.shift(1).rolling(168, min_periods=1).mean()
-    )
-    hist["rolling_24h_rph_mean"] = grp["target_rph"].transform(
-        lambda s: s.shift(1).rolling(24, min_periods=1).mean()
-    )
-    hist["rolling_7d_rph_mean"] = grp["target_rph"].transform(
-        lambda s: s.shift(1).rolling(168, min_periods=1).mean()
-    )
-    hist["rolling_24h_rph_std"] = grp["target_rph"].transform(
-        lambda s: s.shift(1).rolling(24, min_periods=2).std()
-    )
+    observed = dense["ts_hour"] <= last_observed
+    dense.loc[observed, "trip_count"] = dense.loc[observed, "trip_count"].fillna(0)
 
-    def merge_lag(df, offset_hours, cols, suffixes):
-        """Shift ts_hour forward by offset so future rows align to lagged history."""
-        shifted = hist[["PUZone", "ts_hour"] + cols].copy()
-        shifted["ts_hour"] = shifted["ts_hour"] + pd.Timedelta(hours=offset_hours)
-        shifted = shifted.rename(columns=dict(zip(cols, suffixes)))
-        return df.merge(shifted, on=["PUZone", "ts_hour"], how="left")
+    def by_zone(col):
+        return dense.groupby("PUZone", sort=False, dropna=False)[col]
+
+    def lag(col, hours):
+        return by_zone(col).shift(hours)
+
+    def rolling(col, hours, stat="mean", min_periods=1):
+        # Window is [t - hours, t - 1] — the current hour is never included
+        return by_zone(col).transform(
+            lambda s: getattr(s.shift(1).rolling(hours, min_periods=min_periods), stat)()
+        )
+
+    def positive(s):
+        return s.where(s > 0)
+
+    feats = dense[["PUZone", "ts_hour"]].copy()
 
     # Trip count lags
-    future = merge_lag(future, 1,   ["trip_count"], ["lag_1h_trip_count"])
-    future = merge_lag(future, 2,   ["trip_count"], ["lag_2h_trip_count"])
-    future = merge_lag(future, 24,  ["trip_count"], ["lag_24h_trip_count"])
-    future = merge_lag(future, 24,  ["rolling_24h_trip_mean"], ["rolling_24h_trip_mean"])
-    future = merge_lag(future, 24,  ["rolling_168h_trip_mean"], ["rolling_168h_trip_mean"])
+    feats["lag_1h_trip_count"]  = lag("trip_count", 1)
+    feats["lag_2h_trip_count"]  = lag("trip_count", 2)
+    feats["lag_24h_trip_count"] = lag("trip_count", 24)
 
     # RPH lags
-    future = merge_lag(
-        future, 1,
-        ["target_rph", "rolling_24h_rph_mean", "rolling_7d_rph_mean", "rolling_24h_rph_std"],
-        ["lag_1h_rph", "rolling_24h_rph_mean", "rolling_7d_rph_mean", "rolling_24h_rph_std"],
-    )
-    future = merge_lag(future, 2,   ["target_rph"], ["lag_2h_rph"])
-    future = merge_lag(future, 24,  ["target_rph"], ["lag_24h_rph"])
-    future = merge_lag(future, 168, ["target_rph"], ["lag_168h_rph"])
+    feats["lag_1h_rph"]   = lag("target_rph", 1)
+    feats["lag_2h_rph"]   = lag("target_rph", 2)
+    feats["lag_24h_rph"]  = lag("target_rph", 24)
+    feats["lag_168h_rph"] = lag("target_rph", 168)
 
-    # Same-hour aggregates -> lag1h_* (mirrors preprocess/features.py shift)
-    future = merge_lag(future, 1, raw_lag1h_cols, [f"lag1h_{c}" for c in raw_lag1h_cols])
+    # Rolling windows
+    feats["rolling_24h_trip_mean"]  = rolling("trip_count", 24)
+    feats["rolling_168h_trip_mean"] = rolling("trip_count", 168)
+    feats["rolling_24h_rph_mean"]   = rolling("target_rph", 24)
+    feats["rolling_7d_rph_mean"]    = rolling("target_rph", 168)
+    feats["rolling_24h_rph_std"]    = rolling("target_rph", 24, "std", min_periods=2)
+    if "frac_airport_pickup" in dense.columns:
+        feats["rolling_airport_activity"] = rolling("frac_airport_pickup", 24)
 
-    # Derived lag features — all vectorised
-    future["trip_count_delta_1h"] = future["lag_1h_trip_count"] - future["lag_2h_trip_count"]
-    future["rph_delta_1h"]        = future["lag_1h_rph"] - future["lag_2h_rph"]
-    future["rph_zscore"] = (
-        (future["lag_1h_rph"] - future["rolling_24h_rph_mean"])
-        / (future["rolling_24h_rph_std"].fillna(0) + 1e-6)
+    # Same-hour aggregates -> lag1h_* (mirrors the `shifted` CTE).
+    # demand_vs_baseline is recomputed on the grid, not read from the store,
+    # so an hour without pickups gives 0 exactly as it does in SQL.
+    dense["demand_vs_baseline"] = dense["trip_count"] / positive(feats["rolling_24h_trip_mean"])
+    for c in raw_lag1h_cols + ["demand_vs_baseline"]:
+        feats[f"lag1h_{c}"] = lag(c, 1)
+
+    # Derived — built only from lags / windows, never the current hour
+    feats["trip_count_delta_1h"] = feats["lag_1h_trip_count"] - feats["lag_2h_trip_count"]
+    feats["rph_delta_1h"]        = feats["lag_1h_rph"] - feats["lag_2h_rph"]
+    feats["rph_zscore"] = (
+        (feats["lag_1h_rph"] - feats["rolling_24h_rph_mean"])
+        / positive(feats["rolling_24h_rph_std"])
     )
-    future["rph_cv"] = (
-        future["rolling_24h_rph_std"].fillna(0)
-        / (future["rolling_24h_rph_mean"].fillna(0) + 1e-6)
-    )
-    future["relative_zone_activity"] = future["lag_1h_trip_count"] / (
-        future["rolling_168h_trip_mean"].replace(0, np.nan)
+    feats["rph_cv"] = feats["rolling_24h_rph_std"] / positive(feats["rolling_24h_rph_mean"])
+    feats["relative_zone_activity"] = (
+        feats["lag_1h_trip_count"] / positive(feats["rolling_168h_trip_mean"])
     )
 
-    return future
+    return future.merge(feats, on=["PUZone", "ts_hour"], how="left")
 
 
 # FILL MISSING VALUES
@@ -413,8 +464,13 @@ def main():
 
     start_dt = resolve_forecast_start(df_hist, args.start)
 
+    # attach_lag_features gets the full store (it cuts at start_dt itself);
+    # everything else only ever sees history before the forecast start.
+    store = df_hist
+    df_hist = history_before(store, start_dt)
+
     future = build_future_frame(df_hist, start_dt, args.hours, models["zone_enc"])
-    future = attach_lag_features(future, df_hist)
+    future = attach_lag_features(future, store)
     future = run_inference(future, models, features, df_hist)
     future = score_and_rank(future)
 

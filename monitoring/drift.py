@@ -89,6 +89,11 @@ EXCLUDED_FEATURES = {
 }
 TARGETS = ["trip_count", "target_rph"]
 
+# The feature store keeps every zone-hour with at least one pickup (the
+# forecasters need them to rebuild lag/rolling features), but models are
+# trained — and drift is measured — only on zone-hours with this many trips.
+MIN_TRIP_COUNT = 5
+
 
 # Reference snapshot (called from models/*/train.py)
 def save_reference(
@@ -243,7 +248,8 @@ def _load_reference(s3, bucket: str) -> pd.DataFrame:
 def _load_current_month(
     s3, bucket: str, columns: list[str], month_start: pd.Timestamp, month_end: pd.Timestamp
 ) -> pd.DataFrame:
-    """Read only TARGET_MONTH rows (and only the needed columns) from the feature store."""
+    """Read only TARGET_MONTH rows (and only the needed columns) from the feature store,
+    restricted to the same trip_count >= MIN_TRIP_COUNT population the models train on."""
     print(f"Downloading s3://{bucket}/{DATA_S3_KEY} ...")
     s3.download_file(bucket, DATA_S3_KEY, TMP_TIMESERIES)
     available = set(pq.read_schema(TMP_TIMESERIES).names)
@@ -253,8 +259,21 @@ def _load_current_month(
         filters=[
             ("ts_hour", ">=", month_start.to_pydatetime()),
             ("ts_hour", "<", month_end.to_pydatetime()),
+            ("trip_count", ">=", MIN_TRIP_COUNT),
         ],
     )
+
+
+def forecast_window(meta: dict) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """
+    First and last forecast hour from a forecast .meta.json. Older EC2
+    forecasts only recorded forecast_start + forecast_hours, so derive the
+    end from those when forecast_end is missing.
+    """
+    start = pd.Timestamp(meta["forecast_start"])
+    if "forecast_end" in meta:
+        return start, pd.Timestamp(meta["forecast_end"])
+    return start, start + pd.Timedelta(hours=int(meta["forecast_hours"]) - 1)
 
 
 def realised_performance(
@@ -277,8 +296,7 @@ def realised_performance(
     frames = []
     for key in sorted(meta_keys):
         meta = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
-        start = pd.Timestamp(meta["forecast_start"])
-        end = pd.Timestamp(meta["forecast_end"])
+        start, end = forecast_window(meta)
         if end < month_start or start >= month_end:
             continue
         csv_key = key[: -len(".meta.json")] + ".csv"

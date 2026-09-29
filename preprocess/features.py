@@ -399,7 +399,95 @@ COPY (
     ),
 
     --------------------------------------------------------------------------
-    -- Lag features
+    -- Gap-free zone × hour grid
+    --
+    -- merged only has a row for zone-hours that had pickups, so ROWS frames
+    -- and LAG(n) over it count *rows*, not hours: for a quiet zone the "24h"
+    -- window could reach back days and lag_1h could be yesterday. Every
+    -- time-series feature below is computed on this grid instead, where each
+    -- zone has exactly one row per hour, so N rows == N hours.
+    --
+    -- An hour with no pickups gets trip_count = 0 (that is an observation);
+    -- every other column is a per-trip aggregate and stays NULL (nothing was
+    -- observed; AVG / STDDEV_SAMP skip NULLs). That is exactly what can be
+    -- rebuilt from the stored rows, which is how the forecasters recreate
+    -- these features at serving time (attach_lag_features).
+    --------------------------------------------------------------------------
+
+    grid AS (
+
+        SELECT
+            z.PUZone,
+            h.ts_hour
+
+        FROM (SELECT DISTINCT PUZone FROM merged) z
+
+        CROSS JOIN range(
+            TIMESTAMP '{buffer_start:%Y-%m-%d}',
+            TIMESTAMP '{month_end:%Y-%m-%d}',
+            INTERVAL 1 HOUR
+        ) h(ts_hour)
+    ),
+
+    dense AS (
+
+        SELECT
+            g.PUZone,
+            g.ts_hour,
+
+            COALESCE(m.trip_count, 0) AS trip_count,
+
+            m.target_rph,
+            m.avg_revenue,
+            m.avg_tip,
+            m.tip_rate,
+            m.avg_distance_mi,
+            m.avg_duration_min,
+            m.precipitation,
+            m.temperature,
+            m.wind_speed,
+            m.frac_raining,
+            m.frac_airport_pickup,
+            m.frac_airport_dropoff,
+            m.dropoff_count,
+            m.net_pickup_flow,
+
+            ------------------------------------------------------------------
+            -- Traffic speed estimate
+            ------------------------------------------------------------------
+
+            CASE
+                WHEN m.avg_duration_min > 0
+                THEN m.avg_distance_mi
+                     / (m.avg_duration_min / 60.0)
+                ELSE NULL
+            END AS avg_speed_mph,
+
+            ------------------------------------------------------------------
+            -- Congestion score
+            ------------------------------------------------------------------
+
+            CASE
+                WHEN m.avg_duration_min > 0
+                     AND m.avg_distance_mi > 0
+                THEN 1.0 /
+                     (
+                        m.avg_distance_mi
+                        / (m.avg_duration_min / 60.0)
+                     )
+                ELSE NULL
+            END AS congestion_score
+
+        FROM grid g
+
+        LEFT JOIN merged m
+            ON m.PUZone IS NOT DISTINCT FROM g.PUZone
+           AND m.ts_hour = g.ts_hour
+    ),
+
+    --------------------------------------------------------------------------
+    -- Lag & rolling features (on the dense grid; the current hour is always
+    -- excluded from every window)
     --------------------------------------------------------------------------
 
     lagged AS (
@@ -411,121 +499,69 @@ COPY (
             -- Revenue lags
             ------------------------------------------------------------------
 
-            LAG(target_rph, 1)
-                OVER (
-                    PARTITION BY PUZone
-                    ORDER BY ts_hour
-                ) AS lag_1h_rph,
-
-            LAG(target_rph, 2)
-                OVER (
-                    PARTITION BY PUZone
-                    ORDER BY ts_hour
-                ) AS lag_2h_rph,
-
-            LAG(target_rph, 24)
-                OVER (
-                    PARTITION BY PUZone
-                    ORDER BY ts_hour
-                ) AS lag_24h_rph,
-
-            LAG(target_rph, 168)
-                OVER (
-                    PARTITION BY PUZone
-                    ORDER BY ts_hour
-                ) AS lag_168h_rph,
+            LAG(target_rph, 1)   OVER w AS lag_1h_rph,
+            LAG(target_rph, 2)   OVER w AS lag_2h_rph,
+            LAG(target_rph, 24)  OVER w AS lag_24h_rph,
+            LAG(target_rph, 168) OVER w AS lag_168h_rph,
 
             ------------------------------------------------------------------
             -- Demand lags
             ------------------------------------------------------------------
 
-            LAG(trip_count, 1)
-                OVER (
-                    PARTITION BY PUZone
-                    ORDER BY ts_hour
-                ) AS lag_1h_trip_count,
-
-            LAG(trip_count, 2)
-                OVER (
-                    PARTITION BY PUZone
-                    ORDER BY ts_hour
-                ) AS lag_2h_trip_count,
-
-            LAG(trip_count, 24)
-                OVER (
-                    PARTITION BY PUZone
-                    ORDER BY ts_hour
-                ) AS lag_24h_trip_count,
-
-            LAG(dropoff_count, 1)
-                OVER (
-                    PARTITION BY PUZone
-                    ORDER BY ts_hour
-                ) AS lag_1h_dropoff_count,
+            LAG(trip_count, 1)    OVER w AS lag_1h_trip_count,
+            LAG(trip_count, 2)    OVER w AS lag_2h_trip_count,
+            LAG(trip_count, 24)   OVER w AS lag_24h_trip_count,
+            LAG(dropoff_count, 1) OVER w AS lag_1h_dropoff_count,
 
             ------------------------------------------------------------------
             -- Rolling demand
             ------------------------------------------------------------------
 
-            AVG(trip_count)
-                OVER (
-                    PARTITION BY PUZone
-                    ORDER BY ts_hour
-                    ROWS BETWEEN 24 PRECEDING AND 1 PRECEDING
-                ) AS rolling_24h_trip_mean,
-
-            AVG(trip_count)
-                OVER (
-                    PARTITION BY PUZone
-                    ORDER BY ts_hour
-                    ROWS BETWEEN 168 PRECEDING AND 1 PRECEDING
-                ) AS rolling_168h_trip_mean,
+            AVG(trip_count) OVER w24  AS rolling_24h_trip_mean,
+            AVG(trip_count) OVER w168 AS rolling_168h_trip_mean,
 
             ------------------------------------------------------------------
             -- Rolling revenue
             ------------------------------------------------------------------
 
-            AVG(target_rph)
-                OVER (
-                    PARTITION BY PUZone
-                    ORDER BY ts_hour
-                    ROWS BETWEEN 24 PRECEDING AND 1 PRECEDING
-                ) AS rolling_24h_rph_mean,
-
-            AVG(target_rph)
-                OVER (
-                    PARTITION BY PUZone
-                    ORDER BY ts_hour
-                    ROWS BETWEEN 168 PRECEDING AND 1 PRECEDING
-                ) AS rolling_7d_rph_mean,
+            AVG(target_rph) OVER w24  AS rolling_24h_rph_mean,
+            AVG(target_rph) OVER w168 AS rolling_7d_rph_mean,
 
             ------------------------------------------------------------------
             -- Rolling volatility
             ------------------------------------------------------------------
 
-            STDDEV_SAMP(target_rph)
-                OVER (
-                    PARTITION BY PUZone
-                    ORDER BY ts_hour
-                    ROWS BETWEEN 24 PRECEDING AND 1 PRECEDING
-                ) AS rolling_24h_rph_std,
+            STDDEV_SAMP(target_rph) OVER w24 AS rolling_24h_rph_std,
 
             ------------------------------------------------------------------
             -- Rolling airport activity
             ------------------------------------------------------------------
 
-            AVG(frac_airport_pickup)
-                OVER (
-                    PARTITION BY PUZone
-                    ORDER BY ts_hour
-                    ROWS BETWEEN 24 PRECEDING AND 1 PRECEDING
-                ) AS rolling_airport_activity
+            AVG(frac_airport_pickup) OVER w24 AS rolling_airport_activity,
 
-        FROM merged
+            ------------------------------------------------------------------
+            -- Weather momentum (same-hour; not a model input)
+            ------------------------------------------------------------------
+
+            precipitation - LAG(precipitation, 1) OVER w AS precipitation_delta
+
+        FROM dense
+
+        WINDOW
+            w    AS (PARTITION BY PUZone ORDER BY ts_hour),
+            w24  AS (PARTITION BY PUZone ORDER BY ts_hour
+                     ROWS BETWEEN 24 PRECEDING AND 1 PRECEDING),
+            w168 AS (PARTITION BY PUZone ORDER BY ts_hour
+                     ROWS BETWEEN 168 PRECEDING AND 1 PRECEDING)
     ),
 
     --------------------------------------------------------------------------
     -- Advanced derived features
+    --
+    -- Anything that is a model input must only use hours BEFORE ts_hour, so
+    -- the revenue momentum / surge features are built from lag_1h_rph, never
+    -- target_rph. (They used to use target_rph: lag_1h_rph + rph_delta_1h
+    -- reconstructed the profit model's label exactly.)
     --------------------------------------------------------------------------
 
     final_features AS (
@@ -540,6 +576,8 @@ COPY (
             lag_1h_trip_count - lag_2h_trip_count
                 AS trip_count_delta_1h,
 
+            -- Uses this hour's trip_count, so models only ever see it as
+            -- lag1h_demand_vs_baseline
             CASE
                 WHEN rolling_24h_trip_mean > 0
                 THEN trip_count
@@ -551,58 +589,21 @@ COPY (
             -- Revenue momentum
             ------------------------------------------------------------------
 
-            target_rph - lag_1h_rph
+            lag_1h_rph - lag_2h_rph
                 AS rph_delta_1h,
 
             ------------------------------------------------------------------
-            -- Revenue surge z-score
+            -- Revenue surge z-score (last hour vs. trailing 24h)
             ------------------------------------------------------------------
 
             CASE
                 WHEN rolling_24h_rph_std > 0
                 THEN (
-                    target_rph
+                    lag_1h_rph
                     - rolling_24h_rph_mean
                 ) / rolling_24h_rph_std
                 ELSE NULL
             END AS rph_zscore,
-
-            ------------------------------------------------------------------
-            -- Traffic speed estimate
-            ------------------------------------------------------------------
-
-            CASE
-                WHEN avg_duration_min > 0
-                THEN avg_distance_mi
-                     / (avg_duration_min / 60.0)
-                ELSE NULL
-            END AS avg_speed_mph,
-
-            ------------------------------------------------------------------
-            -- Congestion score
-            ------------------------------------------------------------------
-
-            CASE
-                WHEN avg_duration_min > 0
-                     AND avg_distance_mi > 0
-                THEN 1.0 /
-                     (
-                        avg_distance_mi
-                        / (avg_duration_min / 60.0)
-                     )
-                ELSE NULL
-            END AS congestion_score,
-
-            ------------------------------------------------------------------
-            -- Weather momentum
-            ------------------------------------------------------------------
-
-            precipitation
-            - LAG(precipitation, 1)
-                OVER (
-                    PARTITION BY PUZone
-                    ORDER BY ts_hour
-                ) AS precipitation_delta,
 
             ------------------------------------------------------------------
             -- Revenue stability
@@ -664,19 +665,38 @@ COPY (
     )
 
     --------------------------------------------------------------------------
-    -- Final dataset — buffer rows dropped, only the target month is kept
+    -- Final dataset — back to one row per zone-hour WITH pickups; buffer
+    -- rows dropped, only the target month is kept.
+    --
+    -- No minimum trip_count here: every zone-hour with a pickup is stored so
+    -- the forecasters can rebuild the dense grid (and hence identical
+    -- lag/rolling features) from this file. Training applies its own
+    -- trip_count >= MIN_TRIP_COUNT filter (monitoring/drift.py).
     --------------------------------------------------------------------------
 
-    SELECT *
-    FROM shifted
+    SELECT
+        m.*,
+        s.* EXCLUDE (
+            PUZone, ts_hour, trip_count, target_rph,
+            avg_revenue, avg_tip, tip_rate,
+            avg_distance_mi, avg_duration_min,
+            precipitation, temperature, wind_speed, frac_raining,
+            frac_airport_pickup, frac_airport_dropoff,
+            dropoff_count, net_pickup_flow
+        )
 
-    WHERE trip_count >= 5
-      AND ts_hour >= TIMESTAMP '{month_start:%Y-%m-%d}'
-      AND ts_hour <  TIMESTAMP '{month_end:%Y-%m-%d}'
+    FROM merged m
+
+    JOIN shifted s
+        ON s.PUZone IS NOT DISTINCT FROM m.PUZone
+       AND s.ts_hour = m.ts_hour
+
+    WHERE m.ts_hour >= TIMESTAMP '{month_start:%Y-%m-%d}'
+      AND m.ts_hour <  TIMESTAMP '{month_end:%Y-%m-%d}'
 
     ORDER BY
-        PUZone,
-        ts_hour
+        m.PUZone,
+        m.ts_hour
 
 ) TO '{TMP_TIMESERIES_MONTH}' (FORMAT PARQUET)
 """)
@@ -828,5 +848,4 @@ print("1. Train demand forecasting model")
 print("2. Train revenue forecasting model")
 print("3. Train competition/saturation model")
 print("4. Build recommendation ranking engine")
-print("5. Add complete hourly time grid")
-print("6. Add neighboring zone spatial features")
+print("5. Add neighboring zone spatial features")

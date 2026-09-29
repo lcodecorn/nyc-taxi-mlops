@@ -88,3 +88,14 @@ def test_decide_collects_every_reason():
 
 def test_decide_without_performance_data():
     assert drift.decide(0.0, {}, None) == []
+
+
+def test_forecast_window_uses_forecast_end_when_present():
+    meta = {"forecast_start": "2025-06-01 00:00:00", "forecast_end": "2025-06-01 23:00:00", "forecast_hours": 24}
+    assert drift.forecast_window(meta) == (pd.Timestamp("2025-06-01 00:00"), pd.Timestamp("2025-06-01 23:00"))
+
+
+def test_forecast_window_derives_end_for_legacy_ec2_meta():
+    # models/ec2/forecast.py used to omit forecast_end; drift must not KeyError on those
+    meta = {"forecast_start": "2025-06-01 00:00:00", "forecast_hours": 48}
+    assert drift.forecast_window(meta) == (pd.Timestamp("2025-06-01 00:00"), pd.Timestamp("2025-06-02 23:00"))

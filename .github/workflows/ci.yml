@@ -37,7 +37,7 @@ jobs:
           cache: pip
 
       - name: Install test dependencies
-        run: pip install pytest boto3 pandas pyarrow python-dotenv numpy scipy
+        run: pip install pytest boto3 pandas pyarrow python-dotenv numpy scipy duckdb joblib
 
       # These tests validate data already landed in S3 and skip themselves
       # when AWS/S3 config isn't present (see tests/test_data_validation_*.py),

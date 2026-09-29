@@ -44,7 +44,7 @@ from sklearn.metrics import accuracy_score, mean_absolute_error, mean_squared_er
 from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBRegressor
 
-from monitoring.drift import save_reference
+from monitoring.drift import MIN_TRIP_COUNT, save_reference
 
 warnings.filterwarnings("ignore")
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -107,8 +107,13 @@ def load_data() -> pd.DataFrame:
     obj = s3.get_object(Bucket=S3_BUCKET, Key=INPUT_S3_KEY)
     with open(LOCAL_PARQUET, "wb") as fh:
         fh.write(obj["Body"].read())
-    df = pd.read_parquet(LOCAL_PARQUET).sort_values("ts_hour").reset_index(drop=True)
-    print(f"Loaded {len(df):,} rows × {df.shape[1]} columns")
+    df = pd.read_parquet(LOCAL_PARQUET)
+    # The store keeps every zone-hour with a pickup (context for the lag /
+    # rolling features); only train on zone-hours with enough trips for
+    # target_rph to be meaningful. Features were computed before this filter.
+    df = df[df["trip_count"] >= MIN_TRIP_COUNT]
+    df = df.sort_values("ts_hour").reset_index(drop=True)
+    print(f"Loaded {len(df):,} rows × {df.shape[1]} columns (trip_count >= {MIN_TRIP_COUNT})")
     return df
 
 
